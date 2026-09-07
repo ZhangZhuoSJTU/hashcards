@@ -1,0 +1,6 @@
+# Course-side exclusions: tests that are environment-sensitive outside the
+# benchmark containers. Format: <branch>/<classname>.<testname>
+
+# "First" parse error depends on directory iteration order, which differs on
+# APFS (invalid2.md is visited before invalid1.md), so the reported file diverges.
+c5f3d8794db4/tests.test_errors.test_check_reports_first_parse_error
