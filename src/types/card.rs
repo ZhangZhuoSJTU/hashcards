@@ -53,9 +53,12 @@ pub enum CardContent {
     Cloze {
         /// The text of the card without brackets.
         text: String,
-        /// The position of the first character of the deletion.
+        /// Byte offset of the first byte of the deletion.
         start: usize,
-        /// The position of the last character of the deletion.
+        /// Byte offset one past the last byte of the deletion (exclusive).
+        ///
+        /// Note: this is an exclusive bound. The deletion spans
+        /// `[start, end)` in `text`.
         end: usize,
     },
 }
@@ -163,6 +166,8 @@ impl CardContent {
             CardContent::Cloze { text, start, end } => {
                 hasher.update(b"Cloze");
                 hasher.update(text.as_bytes());
+                // Include the deletion bounds so that two cards with the
+                // same text but different deletions get different hashes.
                 hasher.update(&start.to_le_bytes());
                 hasher.update(&end.to_le_bytes());
             }
@@ -194,7 +199,11 @@ impl CardContent {
             }
             CardContent::Cloze { text, start, end } => {
                 let mut text_bytes: Vec<u8> = text.as_bytes().to_owned();
-                text_bytes.splice(*start..*end + 1, CLOZE_TAG_BYTES.iter().copied());
+                // The cloze deletion occupies `[start, end + 1)` in the
+                // original text. We splice in a placeholder tag that is
+                // later replaced by the rendered cloze span.
+                let deletion_range = (*start)..(*end + 1);
+                text_bytes.splice(deletion_range, CLOZE_TAG_BYTES.iter().copied());
                 let text: String = String::from_utf8(text_bytes)?;
                 let text: String = markdown_to_html(config, &text)?;
                 let text: String =
@@ -216,10 +225,11 @@ impl CardContent {
             }
             CardContent::Cloze { text, start, end } => {
                 let mut text_bytes: Vec<u8> = text.as_bytes().to_owned();
-                let deleted_text: Vec<u8> = text_bytes[*start..*end + 1].to_owned();
+                let deletion_range = (*start)..(*end + 1);
+                let deleted_text: Vec<u8> = text_bytes[deletion_range.clone()].to_owned();
                 let deleted_text: String = String::from_utf8(deleted_text)?;
                 let deleted_text: String = markdown_to_html_inline(config, &deleted_text)?;
-                text_bytes.splice(*start..*end + 1, CLOZE_TAG_BYTES.iter().copied());
+                text_bytes.splice(deletion_range, CLOZE_TAG_BYTES.iter().copied());
                 let text: String = String::from_utf8(text_bytes)?;
                 let text = markdown_to_html(config, &text)?;
                 let text = text.replace(

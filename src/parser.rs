@@ -449,152 +449,144 @@ impl Parser {
         let text = text.trim();
         let mut cards = Vec::new();
 
-        // The full text of the card, without cloze deletion brackets.
+        // First pass: build the "clean" version of the text, i.e. the text
+        // with the cloze deletion brackets removed, while preserving any
+        // brackets that belong to Markdown images (`![`) or that have been
+        // escaped (`\[`, `\]`).
+        //
+        // We walk over bytes rather than chars because the deletion offsets
+        // recorded below are byte offsets, and mixing the two would be a
+        // source of subtle bugs.
         let clean_text: String = {
-            let mut clean_text: Vec<u8> = Vec::new();
-            // Flags to indicate should treat the next `[` or `]` differently.
-            // Set when the preceeding byte indicates it should be evaluated as
-            // markdown and not part of the cloze and therefore added to clean_text.
-            let mut image_mode = false; // ![
-            let mut escape_mode = false; // \[ and \]
-            // We use `bytes` rather than `chars` because the cloze start/end
-            // positions are byte positions, not character positions. This
-            // keeps things tractable: bytes are well-understood, "characters"
-            // are a vague abstract concept.
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut image_mode = false;
+            let mut escape_mode = false;
+
             for (bytepos, c) in text.bytes().enumerate() {
-                if c == b'[' {
-                    if image_mode {
-                        clean_text.push(c);
-                    }
-                    if escape_mode {
-                        escape_mode = false;
-                        clean_text.push(c);
-                    }
-                } else if c == b']' {
-                    if image_mode {
-                        // We are in image mode, so this closing bracket is
-                        // part of a Markdown image.
-                        image_mode = false;
-                        clean_text.push(c);
-                    } else if escape_mode {
-                        // We are in escape mode, so this closing bracket is
-                        // part of the markdown text.
-                        escape_mode = false;
-                        clean_text.push(c);
-                    }
-                } else if c == b'!' {
-                    if !image_mode {
-                        // image_mode must be turned on *only* if the '!' is
-                        // immediately before a `[`. Otherwise, exclamation
-                        // marks in other positions would trigger it.
-                        let nextopt = text.as_bytes().get(bytepos + 1).copied();
-                        match nextopt {
-                            Some(b'[') => {
-                                image_mode = true;
-                            }
-                            _ => {}
+                match c {
+                    b'[' => {
+                        if image_mode {
+                            buffer.push(c);
+                        }
+                        if escape_mode {
+                            escape_mode = false;
+                            buffer.push(c);
                         }
                     }
-                    clean_text.push(c);
-                } else if c == b'\\' {
+                    b']' => {
+                        if image_mode {
+                            image_mode = false;
+                            buffer.push(c);
+                        } else if escape_mode {
+                            escape_mode = false;
+                            buffer.push(c);
+                        }
+                    }
+                    b'!' => {
+                        if !image_mode {
+                            if let Some(b'[') = text.as_bytes().get(bytepos + 1).copied() {
+                                image_mode = true;
+                            }
+                        }
+                        buffer.push(c);
+                    }
+                    b'\\' => {
+                        if !escape_mode {
+                            match text.as_bytes().get(bytepos + 1).copied() {
+                                Some(b'[') | Some(b']') => {
+                                    escape_mode = true;
+                                }
+                                _ => {
+                                    buffer.push(c);
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        buffer.push(c);
+                    }
+                }
+            }
+
+            String::from_utf8(buffer).map_err(|_| {
+                ParserError::new(
+                    "Cloze card contains invalid UTF-8.",
+                    self.file_path.clone(),
+                    start_line,
+                )
+            })?
+        };
+
+        // Second pass: locate every cloze deletion in the original text.
+        //
+        // A deletion is a `[` ... `]` pair that is not escaped and not part
+        // of a Markdown image. `deletion_end` is *exclusive*: it points one
+        // byte past the last byte of the deletion, so the deletion spans
+        // `[deletion_start, deletion_end)`.
+        let mut deletion_start: Option<usize> = None;
+        let mut cursor: usize = 0;
+        let mut image_mode = false;
+        let mut escape_mode = false;
+
+        for (bytepos, c) in text.bytes().enumerate() {
+            match c {
+                b'[' => {
+                    if image_mode {
+                        cursor += 1;
+                    } else if escape_mode {
+                        cursor += 1;
+                        escape_mode = false;
+                    } else {
+                        deletion_start = Some(cursor);
+                    }
+                }
+                b']' => {
+                    if image_mode {
+                        image_mode = false;
+                        cursor += 1;
+                    } else if escape_mode {
+                        escape_mode = false;
+                        cursor += 1;
+                    } else if let Some(s) = deletion_start {
+                        let deletion_end = cursor;
+                        let content = CardContent::new_cloze(
+                            clean_text.clone(),
+                            s,
+                            deletion_end,
+                        );
+                        let card = Card::new(
+                            self.deck_name.clone(),
+                            self.file_path.clone(),
+                            (start_line, end_line),
+                            content,
+                        );
+                        cards.push(card);
+                        deletion_start = None;
+                    }
+                }
+                b'!' => {
+                    if !image_mode {
+                        if let Some(b'[') = text.as_bytes().get(bytepos + 1).copied() {
+                            image_mode = true;
+                        }
+                    }
+                    cursor += 1;
+                }
+                b'\\' => {
                     if !escape_mode {
-                        // escape_mode must be turned on *only* if the '\' is
-                        // immediately before a `[` or `]`. Otherwise, backslashes
-                        // in other positions would trigger it.
-                        let nextopt = text.as_bytes().get(bytepos + 1).copied();
-                        match nextopt {
+                        match text.as_bytes().get(bytepos + 1).copied() {
                             Some(b'[') | Some(b']') => {
                                 escape_mode = true;
                             }
                             _ => {
-                                clean_text.push(c);
+                                cursor += 1;
                             }
                         }
                     }
-                } else {
-                    clean_text.push(c);
                 }
-            }
-            match String::from_utf8(clean_text) {
-                Ok(s) => s,
-                Err(_) => {
-                    return Err(ParserError::new(
-                        "Cloze card contains invalid UTF-8.",
-                        self.file_path.clone(),
-                        start_line,
-                    ));
+                _ => {
+                    cursor += 1;
                 }
-            }
-        };
-
-        let mut start = None;
-        let mut index = 0;
-        let mut image_mode = false;
-        let mut escape_mode = false;
-        for (bytepos, c) in text.bytes().enumerate() {
-            if c == b'[' {
-                if image_mode {
-                    // We are in image mode, so this closing bracket is part of a markdown image.
-                    index += 1;
-                } else if escape_mode {
-                    // We are in escape mode, so this closing bracket is part of a markdown text.
-                    index += 1;
-                    escape_mode = false;
-                } else {
-                    start = Some(index);
-                }
-            } else if c == b']' {
-                if image_mode {
-                    // We are in image mode, so this closing bracket is part of a markdown image.
-                    image_mode = false;
-                    index += 1;
-                } else if escape_mode {
-                    // We are in escape mode, so this closing bracket is part of a markdown text.
-                    escape_mode = false;
-                    index += 1;
-                } else if let Some(s) = start {
-                    let end = index;
-                    let content = CardContent::new_cloze(clean_text.clone(), s, end - 1);
-                    let card = Card::new(
-                        self.deck_name.clone(),
-                        self.file_path.clone(),
-                        (start_line, end_line),
-                        content,
-                    );
-                    cards.push(card);
-                    start = None;
-                }
-            } else if c == b'!' {
-                if !image_mode {
-                    // image_mode must be turned on *only* if the '!' is
-                    // immediately before a `[`. Otherwise, exclamation
-                    // marks in other positions would trigger it.
-                    let nextopt = text.as_bytes().get(bytepos + 1).copied();
-                    match nextopt {
-                        Some(b'[') => {
-                            image_mode = true;
-                        }
-                        _ => {}
-                    }
-                }
-                index += 1;
-            } else if c == b'\\' {
-                if !escape_mode {
-                    // escape_mode must be turned on *only* if the '\' is
-                    // immediately before a `[` or `]`. Otherwise, backslashes
-                    // in other positions would trigger it.
-                    let nextopt = text.as_bytes().get(bytepos + 1).copied();
-                    match nextopt {
-                        Some(b'[') | Some(b']') => {
-                            escape_mode = true;
-                        }
-                        _ => {
-                            index += 1;
-                        }
-                    }
-                }
-            } else {
-                index += 1;
             }
         }
 
